@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# models, media, and smoke-test output -- never commit these
+*.bin
+*.ggml
+*_smoke_test_output/
+smoke_test_output/
+*.mp4
+*.wav
+*.jpg
+*.jpeg
+*.png
+
+# frame/vision caches, if ever pointed at a path inside the repo
+videolens_frame_cache/
+videolens_vision_cache/
+video_lens_downloads/
+videolens_jobs/
+
+# process_video()'s default output_dir is CWD-relative (./videolens_output) --
+# real generated KnowledgePackage JSON lands here if run from the repo root
+videolens_output/
+
+.env
+.env.*

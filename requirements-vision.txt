@@ -1,0 +1,10 @@
+# Optional: only needed to use the built-in Claude-backed vision provider
+# (adapters/vision/claude_vision.py). Video-Lens's core pipeline --
+# ingestion, transcription, frame extraction, pointer detection, evidence
+# correlation, knowledge packaging -- does not require this and works fully
+# without it (vision_enabled=False, or supply your own VisionAdapter via
+# PipelineConfig.vision_provider -- see docs/vision.md).
+#
+#     pip install -r requirements.txt -r requirements-vision.txt
+
+anthropic>=0.40

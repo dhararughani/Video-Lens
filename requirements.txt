@@ -1,0 +1,10 @@
+# Core Video-Lens: ingestion, transcription, frame extraction, pointer
+# detection, evidence correlation, knowledge packaging. No AI provider
+# dependency lives here -- see requirements-vision.txt.
+scenedetect>=0.7,<0.8
+yt-dlp>=2026.1
+faster-whisper>=1.2,<2
+opencv-python>=4.8  # already a transitive dep of scenedetect; pinned explicitly
+                    # since adapters/pointer imports it directly (see docs/pointer.md)
+numpy>=1.24          # already a transitive dep of opencv-python/scenedetect/ctranslate2;
+                    # pinned explicitly since adapters/pointer imports it directly
