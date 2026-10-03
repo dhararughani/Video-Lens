@@ -159,6 +159,78 @@ not_detected, detected` stays exactly that; the missing middle is never
 invented. `PointerTrack.confidence` (fraction of events `"detected"`) makes
 this honest at the track level too.
 
+## Cursor intelligence: movement over time (`core.cursor_intelligence`)
+
+A temporal analysis layer over a `PointerTrack` that already exists — it
+detects nothing itself and reads no pixels. It answers only: was pointer
+movement observed, when, in which direction, at roughly what speed, and how
+sure is that.
+
+```python
+from video_lens import analyze_cursor_motion        # track_pointer + analyze_track
+track, segments = analyze_cursor_motion(video, 30.0, 50.0, interval_sec=0.5)
+# or, given any PointerTrack:
+from core.cursor_intelligence import analyze_track
+segments = analyze_track(track)
+```
+
+Opt-in: a default run does not call it, so default pipeline behavior and cost
+are unchanged. Since knowledge schema `1.2` its segments are first-class
+evidence (`core.evidence.cursor_segment_to_evidence` ->
+`Evidence(kind="cursor_track")`, see `docs/evidence.md`, "Measured evidence").
+`PipelineConfig(cursor_intelligence_enabled=True)` segments the pointer events
+the pipeline already detected -- keyframes are seconds apart, so expect mostly
+`"uncertain"` there; call `analyze_cursor_motion` for dense tracking.
+
+**There is no `"stationary"`.** The detector finds a cursor by its *motion*
+(see "a paused cursor is invisible" above), so "no movement observed" is
+absence of evidence, never evidence of stillness. `CursorSegment.motion_state`
+is only `"moving"` or `"uncertain"`, and the contract rejects anything else.
+Two confident detections at the same spot are `uncertain` too
+(`displacement_within_jitter`): the cursor may have paused, or moved away and
+back between samples.
+
+- **Segmentation**: each pair of consecutive samples is one interval. It is
+  `moving` only when both ends are `detected` (not `uncertain` — the detector
+  picked among several candidates there), at most `max_interval_sec` (default
+  2.0s) apart, in frames of the same size, and displaced by at least 0.03 of
+  the frame diagonal (detector jitter). Every other interval is `uncertain`,
+  and its `basis` says why: `pointer_not_observed`, `ambiguous_position`,
+  `sampling_gap`, `displacement_within_jitter`, `frame_size_changed`,
+  `zero_elapsed_time`, `not_sampled` (outside the sampled range),
+  `too_few_samples`, `no_pointer_samples`. Adjacent moving intervals merge, as
+  do adjacent uncertain ones with the same reason. Segments **tile the track's
+  whole range** with no gaps, so every moment is accounted for.
+- **Geometry** uses pixel coordinates normalized by the **frame diagonal**, not
+  x and y separately: per-axis normalization would distort angles on any
+  non-square frame (on 16:9, a visually 45° move would read ~29°). Distance in
+  diagonals is isotropic and resolution-independent — the same convention the
+  detector uses for its step limit.
+- **Direction** (`direction_deg`): image convention — 0° right, 90° down, 180°
+  left, 270° up, in [0, 360), from the first to the last position of the
+  segment, rounded to 0.1°. Reported only when the path is nearly straight (net
+  displacement ≥ 0.8 × path length); a path that turns is `moving` with
+  `direction_deg=None` (`basis` ends `_heading_varies`).
+- **Speed** (`mean_speed_norm`): observed path length ÷ elapsed time, in **frame
+  diagonals per second** — not pixels, not physical units. The path is straight
+  lines between samples, so it is a *lower bound* if the cursor curved between
+  them. The real elapsed time is used, so uneven sampling is handled exactly.
+- **Confidence** (moving only; uncertain is always 0.0): the mean detector
+  confidence of the segment's positions × observation support, where support
+  is `min(1, displaced_intervals / 2)` — one displaced interval alone counts
+  half. A description of evidence quality, not a probability.
+
+**Not detected, deliberately**: clicks, ripples, drags, hovering, selecting, or
+what the pointer is "pointing at". Those are interpretation for a later layer.
+
+Real-video result (the screen recording above, 30–50s at 0.5s): of 41 samples,
+6 `detected`, 20 `uncertain`, 15 `not_detected`. Two short intervals were
+`moving`; the rest is `uncertain` with reasons. One was checked by eye: 34.0s →
+34.5s, (372,256) → (252,244), reported as 185.7° (left, slightly up) — the
+cursor really did travel from the panel divider to a colour swatch. This layer
+adds structure to the existing signal; it does **not** raise the detection
+rate.
+
 ## Repository / mechanism investigation
 
 No mature, general-purpose off-the-shelf library solves "recover an

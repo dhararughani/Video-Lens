@@ -4,6 +4,7 @@ library (Whisper, ffmpeg, PySceneDetect, a VLM, ...).
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol
 
 from core.contracts import (
@@ -37,6 +38,35 @@ class PointerAdapter(Protocol):
 class VisionAdapter(Protocol):
     def analyze_frame(self, frame: Frame, transcript_context: str | None = None,
                        pointer: PointerEvent | None = None) -> VisionObservation: ...
+
+
+class VideoUnderstandingAdapter(Protocol):
+    """A sibling to `VisionAdapter`, not a replacement: a provider that reasons
+    over the VIDEO itself (or a window of it) rather than over one still frame
+    Video-Lens extracted -- e.g. a model with native video input. It can speak
+    about moments Video-Lens never sampled.
+
+    It returns ordinary `VisionObservation`s, each grounded at its own
+    `timestamp_sec` (seconds from the start of the video). An observation the
+    provider cannot ground in time -- a whole-video summary, say -- must not be
+    returned with an invented timestamp: return nothing for it. Video-Lens
+    re-validates everything it receives and drops anything without a valid
+    timestamp inside the video, so a fabricated or missing time never attaches
+    a claim to an arbitrary frame. `frame_path` may be "" (there is no frame).
+
+    `start_sec`/`end_sec` bound the part of the video to analyze (end None
+    meaning the end of the video), the same convention as `extract_window` and
+    `track_pointer`. `prompt` is an optional question to focus the analysis;
+    the pipeline passes None. Everything after `video` is keyword-only, so the
+    seam can grow without breaking implementations.
+
+    Optional and opt-in, exactly like `KnowledgeSynthesizer`: Video-Lens ships NO
+    implementation and requires none. Raising is a supported outcome -- the job
+    continues without this stream (see video_lens.py). Credentials, uploads,
+    timeouts and caching are the implementation's own concern."""
+    def analyze_video(self, video: VideoInput, *, transcript: Transcript | None = None,
+                      start_sec: float = 0.0, end_sec: float | None = None,
+                      prompt: str | None = None) -> Sequence[VisionObservation]: ...
 
 
 class KnowledgeSynthesizer(Protocol):

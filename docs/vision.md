@@ -38,7 +38,9 @@ result = analyze_video("video.mp4", PipelineConfig(vision_provider=my_provider))
 A future `OpenAIVisionProvider`, `GeminiVisionProvider`, `LocalVLMProvider`,
 or a test fake all just need to implement the same two-method shape --
 `core/contracts.py`/`core/interfaces.py` never change, and no other part of
-the pipeline needs to know which one is running.
+the pipeline needs to know which one is running. A `VisionAdapter` should report
+trouble by returning `status="failed"`/`"unavailable"`, as the built-in one does.
+Raising an exception fails the job, unlike the native video seam below.
 
 ```python
 from adapters.ingestion import ingest
@@ -63,6 +65,73 @@ for frame, pointer in zip(frames, pointers):
         description=obs.description, pointer=pointer, vision=obs,
     )
 ```
+
+## Native video understanding: a sibling seam
+
+`VisionAdapter` looks at **one still frame** Video-Lens extracted.
+`core.interfaces.VideoUnderstandingAdapter` is a separate, optional seam for a
+provider that reasons over **the video itself** — and so can speak about
+moments Video-Lens never sampled as frames:
+
+```python
+class VideoUnderstandingAdapter(Protocol):
+    def analyze_video(self, video: VideoInput, *, transcript: Transcript | None = None,
+                      start_sec: float = 0.0, end_sec: float | None = None,
+                      prompt: str | None = None) -> Sequence[VisionObservation]: ...
+
+result = analyze_video("video.mp4", PipelineConfig(video_understanding_provider=my_video_model))
+```
+
+**No implementation is bundled, and none is required.** The default is `None`,
+which means the provider is never called: no network, no upload, no added cost,
+and `analyze_video` output is unchanged. Supplying one is the opt-in (it runs
+even with `vision_enabled=False`; the two seams are independent). Like
+`KnowledgeSynthesizer`, a concrete provider — a hosted model with native video
+input, a local video-LM — lives on *your* side of the seam, never in `core/`:
+inject it via `PipelineConfig`, or keep validation-only implementations under
+`scripts/` (as `scripts/ollama_vision_test_adapter.py` does for frames).
+Credentials, uploading the video, timeouts and caching are the provider's own
+concern; Video-Lens adds none of them.
+
+- **Same output contract.** A provider returns ordinary `VisionObservation`s —
+  the same 4-state honesty (`ok`/`low_information`/`failed`/`unavailable`),
+  elements, confidence and `model`. `frame_path` may be `""`: there is no frame.
+- **Timestamps are mandatory, never invented.** Each observation must be
+  grounded at its own `timestamp_sec`. Video-Lens re-checks every item and drops
+  anything that is not a `VisionObservation` with a finite timestamp inside the
+  video (+1.0s, the clamping tolerance used everywhere). A whole-video summary
+  with no real timestamp is therefore **not** attached to some arbitrary frame —
+  return nothing for it rather than a made-up time.
+- **Merge — both kept.** Native observations are correlated exactly like
+  per-frame vision (`nearest_within_tolerance`, inclusive, `tolerance_sec`), but
+  as their own input, so at a moment where both exist **both** become `vision`
+  evidence; neither displaces the other. A "per-frame wins" rule was rejected:
+  keyframes sit on a 2s grid and native models typically report whole seconds,
+  so ties would land on every even second and discard about half of the native
+  evidence. Each usable native observation also gets a correlation window at
+  its own moment, so evidence about an unsampled moment is kept.
+- **The single `vision` slot** on `MultimodalObservation` holds per-frame vision
+  when usable there, else the native observation, and always matches its
+  `description`. Native observations carry
+  `analysis_metadata["evidence_source"] = "video_understanding"` alongside the
+  provider's own metadata.
+- **Inference rules are unchanged**: the deterministic rules (e.g. "pointer
+  inside a vision-located region") still read per-frame vision only.
+- **Failure never fails the job.** If the provider raises an `Exception` (not
+  `BaseException` — Ctrl+C still stops the run), times out, or returns something
+  that is not a sequence, the analysis continues without this stream, and each
+  window records `"video_understanding"` in `unavailable`. The warning names the
+  exception *type* only: provider/SDK errors often embed request URLs, which
+  may be signed, and Video-Lens does not print them.
+- **Not a new evidence kind — but never indistinguishable.** Native output is
+  interpreted visual content — `Evidence.kind == "vision"`, exactly what that
+  kind already means. Since schema `1.2` it carries
+  `Evidence.source == "video_understanding"` (per-frame vision has the default
+  `""`), so a consumer, the synthesis brief and claim verification can always
+  tell the two apart; identical text from both is never merged. Evidence-frame
+  bundling (`core/visual_evidence.py`) no longer maps a native observation to
+  the sampled frame at the same timestamp: it did not come from that frame, so
+  citing it does not pull the frame in as its source image.
 
 ## Vision backend selected: the Claude API
 

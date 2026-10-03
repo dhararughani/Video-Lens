@@ -6,6 +6,7 @@ translate to/from these shapes so the core stays swappable.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 
@@ -162,6 +163,51 @@ class PointerTrack:
     confidence: float = 0.0  # fraction of events with status == "detected"
 
 
+# CursorSegment.motion_state. There is deliberately NO "stationary": the pointer
+# detector finds a cursor by its motion, so a cursor that holds still is
+# invisible to it -- "no movement observed" is absence of evidence, never
+# evidence of stillness. See core/cursor_intelligence.py.
+CURSOR_MOTION_STATES = ("moving", "uncertain")
+
+
+@dataclass(frozen=True)
+class CursorSegment:
+    """One stretch of a PointerTrack's time range and what the pointer evidence
+    establishes about it. Segments from `analyze_track` tile the track's range
+    with no gaps, so every moment is accounted for -- "uncertain" included.
+
+    `direction_deg`: image convention, 0 = right, 90 = down, 180 = left,
+    270 = up, in [0, 360). `mean_speed_norm`: frame diagonals per second.
+    Both are only ever set for "moving", and only when the evidence supports
+    them; `basis` names the deterministic rule that produced the segment."""
+    start_sec: float
+    end_sec: float
+    motion_state: str  # one of CURSOR_MOTION_STATES
+    direction_deg: float | None = None
+    mean_speed_norm: float | None = None
+    confidence: float = 0.0
+    basis: str = ""
+
+    def __post_init__(self):
+        if self.motion_state not in CURSOR_MOTION_STATES:
+            raise ValueError(f"invalid CursorSegment motion_state: {self.motion_state!r}")
+        if self.end_sec < self.start_sec:
+            raise ValueError(f"segment ends before it starts: {self.start_sec} > {self.end_sec}")
+        if not self.basis:
+            raise ValueError("a CursorSegment must state its basis")
+        if not (0.0 <= self.confidence <= 1.0):
+            raise ValueError(f"confidence must be in [0, 1], got {self.confidence}")
+        if self.direction_deg is not None and not (0.0 <= self.direction_deg < 360.0):
+            raise ValueError(f"direction_deg must be in [0, 360), got {self.direction_deg}")
+        if self.motion_state == "uncertain":
+            if self.direction_deg is not None or self.mean_speed_norm is not None:
+                raise ValueError("an 'uncertain' segment establishes no direction or speed")
+            if self.confidence != 0.0:
+                raise ValueError("an 'uncertain' segment establishes nothing -- confidence must be 0.0")
+        elif self.mean_speed_norm is None or self.mean_speed_norm <= 0:
+            raise ValueError("a 'moving' segment must report a positive speed")
+
+
 @dataclass(frozen=True)
 class Region:
     """A bounding box normalized to 0.0-1.0 in both axes, so the same region
@@ -179,6 +225,121 @@ class Region:
             raise ValueError(
                 f"Region must have x2>x1 and y2>y1, got ({self.x1},{self.y1})-({self.x2},{self.y2})"
             )
+
+
+@dataclass(frozen=True)
+class InspectionRequest:
+    """A precise "look closely here" request: one moment, or a time window
+    around it, optionally cropped to a `Region` and downscaled. Everything
+    except `timestamp_sec` is optional and defaults to "the whole frame at
+    source resolution".
+
+    `fps=None` means a single frame at `timestamp_sec`. A request with a time
+    window MUST say how densely to sample it -- there is no sensible implicit
+    default, and silently picking one would make the cost of a request
+    unpredictable. `scale_width` is a target width in pixels; height follows
+    from the (cropped) aspect ratio."""
+    timestamp_sec: float
+    window_before_sec: float = 0.0
+    window_after_sec: float = 0.0
+    fps: float | None = None
+    scale_width: int | None = None
+    region: Region | None = None
+
+    def __post_init__(self):
+        for name, v in (("timestamp_sec", self.timestamp_sec),
+                        ("window_before_sec", self.window_before_sec),
+                        ("window_after_sec", self.window_after_sec)):
+            if not math.isfinite(v) or v < 0:
+                raise ValueError(f"InspectionRequest.{name} must be a finite number >= 0, got {v}")
+        if self.fps is not None and (not math.isfinite(self.fps) or self.fps <= 0):
+            raise ValueError(f"InspectionRequest.fps must be a finite number > 0, got {self.fps}")
+        if self.scale_width is not None and (
+                isinstance(self.scale_width, bool) or not isinstance(self.scale_width, int)
+                or self.scale_width <= 0):
+            raise ValueError(f"InspectionRequest.scale_width must be a positive integer, "
+                             f"got {self.scale_width!r}")
+        if (self.window_before_sec or self.window_after_sec) and self.fps is None:
+            raise ValueError("InspectionRequest with a time window requires fps -- "
+                             "say how densely to sample it")
+
+
+@dataclass(frozen=True)
+class InspectionResult:
+    """What a targeted inspection produced, with the request that produced it
+    so a result is self-describing. `frames` are ordered by time, each with the
+    ordinary `Frame` provenance (`source_video`, `timestamp_sec`); for a cropped
+    or scaled request their `width`/`height` are the OUTPUT dimensions, not the
+    source's."""
+    request: InspectionRequest
+    frames: tuple[Frame, ...]
+    video_source: str  # VideoInput.path the frames were extracted from
+    extraction_method: str = "ffmpeg_seek"
+
+
+# VisualChangeEvent vocabularies. `kind` names the DETECTION LEVEL only -- how
+# far the change spread -- never what it means. Semantic labels ("scroll",
+# "zoom", "redraw", ...) are interpretation and deliberately absent; see
+# core/visual_change.py.
+VISUAL_CHANGE_STATUSES = ("detected", "not_detected", "unavailable")
+VISUAL_CHANGE_KINDS = ("visual_change", "visual_change_localized", "visual_change_global")
+
+
+@dataclass(frozen=True)
+class VisualChangeEvent:
+    """A deterministic measurement of how much the picture changed between two
+    sampled frames -- a raw observation, not an interpretation. Not (yet) an
+    `Evidence` kind: see core/visual_change.py.
+
+    `status` is the honest signal, as on `PointerEvent`:
+      "detected"     -- compared, and `magnitude >= threshold`
+      "not_detected" -- compared, and below threshold
+      "unavailable"  -- could NOT be compared (unreadable frame, different
+                        sizes, no OpenCV). `magnitude` is then None, never 0.0:
+                        a failed comparison is not evidence the frames matched.
+
+    `timestamp_sec` is always the LATER frame's (`compared_timestamps[1]`): the
+    first moment the new state is observed. The change itself happened
+    somewhere in `(compared_timestamps[0], compared_timestamps[1]]`; no finer
+    precision than the sampling interval is claimed."""
+    timestamp_sec: float
+    kind: str  # one of VISUAL_CHANGE_KINDS
+    status: str  # one of VISUAL_CHANGE_STATUSES
+    magnitude: float | None  # changed fraction of frame area, [0, 1]; None iff unavailable
+    regions: tuple[Region, ...] = ()  # where it changed; non-empty iff detected
+    confidence: float = 0.0  # distance from the decision threshold -- see core/visual_change.py
+    detection_method: str = ""  # algorithm + parameters, so an event is self-describing
+    compared_timestamps: tuple[float, float] = (0.0, 0.0)  # (earlier, later)
+    detail: str = ""  # why unavailable, or what was truncated -- plain language
+
+    def __post_init__(self):
+        if self.status not in VISUAL_CHANGE_STATUSES:
+            raise ValueError(f"invalid VisualChangeEvent status: {self.status!r}")
+        if self.kind not in VISUAL_CHANGE_KINDS:
+            raise ValueError(f"invalid VisualChangeEvent kind: {self.kind!r}")
+        earlier, later = self.compared_timestamps
+        if later < earlier:
+            raise ValueError(f"compared_timestamps must be (earlier, later), got {self.compared_timestamps}")
+        if self.timestamp_sec != later:
+            raise ValueError("VisualChangeEvent.timestamp_sec must be the later compared timestamp")
+        if (self.magnitude is None) != (self.status == "unavailable"):
+            raise ValueError("magnitude must be None exactly when status is 'unavailable'")
+        if self.magnitude is not None and not (0.0 <= self.magnitude <= 1.0):
+            raise ValueError(f"magnitude must be in [0, 1], got {self.magnitude}")
+        if not (0.0 <= self.confidence <= 1.0):
+            raise ValueError(f"confidence must be in [0, 1], got {self.confidence}")
+        if self.status == "unavailable" and self.confidence != 0.0:
+            raise ValueError("an 'unavailable' VisualChangeEvent establishes nothing -- confidence must be 0.0")
+        if self.status == "detected":
+            if self.kind == "visual_change":
+                raise ValueError("a detected change must say whether it is localized or global")
+            if not self.regions:
+                raise ValueError("a detected change must locate at least one region")
+        else:
+            if self.kind != "visual_change":
+                raise ValueError(f"kind {self.kind!r} asserts an extent; only valid when detected")
+            if self.regions:
+                raise ValueError("regions are only reported for a detected change")
 
 
 @dataclass(frozen=True)
@@ -239,6 +400,14 @@ class MultimodalObservation:
     vision: VisionObservation | None = None
 
 
+# Every Evidence.kind. The six are the whole vocabulary: the first four are the
+# original streams; "visual_change" and "cursor_track" (schema 1.2) are the
+# deterministic temporal measurements from core/visual_change.py and
+# core/cursor_intelligence.py. Native-video vision is NOT a kind of its own --
+# it is "vision", told apart by `Evidence.source`.
+EVIDENCE_KINDS = ("frame", "transcript", "pointer", "vision", "visual_change", "cursor_track")
+
+
 @dataclass(frozen=True)
 class Evidence:
     """A pointer back to ONE actual piece of source material -- a raw fact,
@@ -246,17 +415,32 @@ class Evidence:
     one) preserves the originating evidence's own quality signal, e.g. a
     `PointerEvent.confidence` or `VisionObservation.confidence` -- this is
     what lets a later `Inference`'s confidence reflect evidence quality
-    rather than being invented fresh."""
+    rather than being invented fresh.
+
+    Schema 1.2 adds two optional fields, both defaulting to the old behavior:
+    `timestamp_end_sec` (the end of a span, for evidence that covers a stretch
+    of time rather than a moment: the two compared frames of a visual change, a
+    cursor segment) and `source` (who produced it -- a detector's method, or
+    "video_understanding" for a native-video provider's `vision` evidence, so
+    it is never mistaken for per-frame vision). For `visual_change` and
+    `cursor_track` the structured measurement lives in `ref` as compact,
+    deterministic JSON (see core/evidence.py)."""
     timestamp_sec: float
-    kind: str  # "frame" | "transcript" | "pointer" | "vision"
-    ref: str  # frame path, transcript segment text, pointer summary, vision description
+    kind: str  # one of EVIDENCE_KINDS
+    ref: str  # frame path, transcript segment text, pointer summary, vision description,
+    # or (visual_change / cursor_track) a compact JSON measurement
     confidence: float | None = None  # None -- the source kind carries no confidence of its own
+    timestamp_end_sec: float | None = None  # None -- a single moment
+    source: str = ""  # provenance label; "" -- nothing beyond `kind` to say
 
     def __post_init__(self):
-        if self.kind not in ("frame", "transcript", "pointer", "vision"):
+        if self.kind not in EVIDENCE_KINDS:
             raise ValueError(f"invalid Evidence kind: {self.kind!r}")
         if self.confidence is not None and not (0.0 <= self.confidence <= 1.0):
             raise ValueError(f"confidence must be in [0, 1], got {self.confidence}")
+        if self.timestamp_end_sec is not None and self.timestamp_end_sec < self.timestamp_sec:
+            raise ValueError(f"evidence span ends before it starts: "
+                             f"{self.timestamp_sec} > {self.timestamp_end_sec}")
 
 
 @dataclass(frozen=True)
@@ -307,6 +491,13 @@ class AnalysisResult:
     evidence: list[Evidence] = field(default_factory=list)
     structured_observations: list[StructuredObservation] = field(default_factory=list)
     summary: str | None = None
+    # Every visual-change measurement supplied to the analysis, as Evidence --
+    # the whole stream, NOT only what fell inside a query window above. The
+    # windows are per-keyframe; a measurement stream sampled on its own time
+    # grid must reach the package and session even where no keyframe is near.
+    # `visual_change` evidence in the windows is a subset of this (same
+    # Evidence values), so consumers merge the two and drop exact duplicates.
+    visual_changes: tuple[Evidence, ...] = ()
 
 
 # --------------------------------------------------------------------------
@@ -326,8 +517,14 @@ class AnalysisResult:
 # `synthesis` -- plus the Claim/VisualEvidence/SynthesisMetadata shapes they
 # use. All four default to empty/None, so a 1.0 consumer reading a 1.1
 # package still finds every field it already knew, unchanged.
+#
+# 1.2 (P1-B) made "visual_change" and "cursor_track" first-class Evidence kinds
+# (EVIDENCE_KINDS), gave Evidence the optional `timestamp_end_sec` / `source`
+# fields, and added the optional `visual_changes` / `cursor_intelligence`
+# fields to KnowledgePackage. All default to empty, so a 1.1 consumer reading
+# a 1.2 package finds every field it already knew, unchanged.
 # --------------------------------------------------------------------------
-KNOWLEDGE_SCHEMA_VERSION = "1.1"
+KNOWLEDGE_SCHEMA_VERSION = "1.2"
 
 
 @dataclass(frozen=True)
@@ -551,3 +748,9 @@ class KnowledgePackage:
     claims: tuple[Claim, ...] = ()
     visual_evidence: tuple[VisualEvidence, ...] = ()
     synthesis: SynthesisMetadata | None = None
+    # Schema 1.2: the deterministic temporal measurements, exposed by category
+    # so a caller need not filter `evidence` by kind. Evidence of kind
+    # "visual_change" / "cursor_track" respectively; empty unless the run
+    # enabled them (see PipelineConfig). Measurements, not claims.
+    visual_changes: tuple[Evidence, ...] = ()
+    cursor_intelligence: tuple[Evidence, ...] = ()

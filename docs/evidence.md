@@ -38,6 +38,45 @@ print(so.disagreements)    # conflicts/gaps, recorded rather than resolved
 print(so.unavailable)      # evidence streams with nothing in this window
 ```
 
+## Measured evidence (schema 1.2)
+
+Two deterministic temporal measurements are first-class `Evidence`, alongside
+`frame`, `transcript`, `pointer` and `vision`:
+
+| kind | from | `timestamp_sec` .. `timestamp_end_sec` | `ref` (compact JSON) | `source` |
+|---|---|---|---|---|
+| `visual_change` | `VisualChangeEvent` (P0-B) | the later compared frame | `kind`, `status`, `magnitude`, `regions`, `compared` `[earlier, later]` | the detection method |
+| `cursor_track` | `CursorSegment` (P0-C) | segment start .. end | `state`, `direction_deg`, `speed_norm`, `basis` | `cursor_intelligence` |
+
+`Evidence.confidence` carries the measurement's own confidence. Two optional
+fields were added to `Evidence` (defaults preserve 1.1 behavior):
+`timestamp_end_sec` (a span) and `source` (provenance -- also
+`"video_understanding"` for native-video `vision`). Mapping lives in
+`core.evidence.visual_change_to_evidence` / `cursor_segment_to_evidence`; the
+detectors know nothing of evidence.
+
+- Both are **opt-in** (`PipelineConfig.visual_change_enabled`,
+  `cursor_intelligence_enabled`, default off). Cursor intelligence reads the
+  pipeline's own pointer events. Visual change has its **own measurement
+  stream** (Step 8): a bounded time grid, independent of keyframe selection
+  (see `docs/frames.md`, "Temporal visual change").
+- **Two routes, one item.** Correlation windows exist only around keyframes, so
+  a stream measured on its own grid would lose everything between them.
+  `build_analysis_result` therefore also keeps the whole stream on
+  `AnalysisResult.visual_changes` (same `visual_change_to_evidence` mapping,
+  `unavailable` excluded). `KnowledgePackage.visual_changes`, the session and
+  stage coverage take the stream plus the windows' copies, deduplicated on the
+  full Evidence value, so a measurement appears once however many windows
+  also saw it. Windows keep their local copies for synthesis context; the
+  synthesis brief is unchanged (it reads windows only).
+- They are measurements, not interpretations: no inference rule reads them, and
+  they never become claims by themselves.
+- A change that could not be compared is recorded as `unavailable`, not
+  evidence. `uncertain` cursor segments are evidence of *uncertainty*;
+  there is no `"stationary"`.
+- `KnowledgePackage.visual_changes` / `.cursor_intelligence` expose them by
+  category. The stages are listed unavailable only when requested and empty.
+
 ## Why no new subsystem
 
 Step 7 adds exactly one new module (`core/evidence.py`) and three small,
@@ -65,7 +104,7 @@ introduces no second time system, just two small generic primitives in
   question.
 - `all_within_tolerance(items, timestamp_sec, tolerance_sec)` -- every item
   within tolerance, ordered by time. Used for pointer events, since motion
-  (moving vs. stationary) needs more than one reading to determine at all --
+  needs more than one reading to determine at all --
   a single nearest pointer event can't show movement (see Observation vs
   inference below).
 
@@ -85,7 +124,7 @@ same order of magnitude as:
   segment's boundary correlate naturally.
 - Step 5's `track_pointer` default sampling interval (0.5s) -- two pointer
   samples land inside a 1.0s window on either side of a query timestamp,
-  which is exactly what the motion-vs-stationary rule needs.
+  which is exactly what the speech/pointer-motion rule needs.
 
 A caller analyzing content with faster cuts or a different frame-selection
 interval should pass a tighter `tolerance_sec`; one is not hardcoded into
@@ -111,7 +150,7 @@ not just convention:
   evidence. It cannot exist without citing at least one `Evidence`
   (`__post_init__` raises otherwise) and must state a `basis` -- a short,
   fixed rule label (`"pointer_in_vision_region"`,
-  `"speech_pointer_stationary"`, `"speech_pointer_motion"`) naming exactly
+  `"speech_pointer_motion"`) naming exactly
   which deterministic rule produced it. There is no code path that can
   write inferred language into `observed`, and no code path that writes an
   `Inference` without a citation -- `tests/test_evidence.py`'s
@@ -153,17 +192,20 @@ involved):
    **not** fall inside any located region, that's recorded as a
    **disagreement** instead (see Disagreement recording), never silently
    dropped or forced into a false-positive inference.
-2. **`speech_pointer_stationary` / `speech_pointer_motion`** -- a
-   transcript segment overlaps the window AND at least two positioned
-   pointer readings exist in it (one reading cannot show motion --
-   `test_single_pointer_reading_does_not_claim_motion_or_stationary` checks
-   this directly). Normalized displacement between the first and last
-   positioned reading is compared against a fixed threshold
-   (`_MOTION_THRESHOLD = 0.03`, documented in `core/evidence.py` as a
-   `ponytail:` simplification -- make configurable if a caller needs
-   per-video tuning). Confidence = fraction of pointer readings in the
-   window that were actually positioned (data completeness), not a made-up
-   number.
+2. **`speech_pointer_motion`** -- a transcript segment overlaps the window
+   AND it holds at least two `detected` pointer readings with only `detected`
+   readings between them (an `uncertain` position is not trusted; a
+   `not_detected` one in between means the path is unknown; one reading cannot
+   show motion). Normalized displacement between the first and last of them
+   must exceed a fixed threshold (`_MOTION_THRESHOLD = 0.03`, a `ponytail:`
+   simplification in `core/evidence.py`). Confidence = that run of readings as
+   a fraction of all pointer readings in the window (data completeness), not a
+   made-up number. **There is no `speech_pointer_stationary` any more** (Step
+   8): it was emitted for a small displacement, including from `uncertain`
+   readings and across undetected gaps, on a video with no cursor at all
+   (docs/benchmark.md). The detector finds the pointer *by* its motion, so
+   stillness can't be established -- the same rule `core.cursor_intelligence`
+   follows. A small or zero displacement yields no inference.
 3. **Vision-without-pointer-confirmation** -- vision located element(s) but
    no positioned pointer evidence exists in the window at all. This is
    *not* scored as an inference (there's no positive claim to make
@@ -216,8 +258,8 @@ bare model score treated as ground truth (rule 12):
 - `pointer_in_vision_region`'s confidence is the **product** of the two
   contributing evidence confidences -- deliberately conservative: it can
   never exceed either input, and drops fast when either signal is weak.
-- `speech_pointer_*`'s confidence is the **fraction of pointer readings in
-  the window that were actually positioned** -- a data-completeness
+- `speech_pointer_motion`'s confidence is the **fraction of pointer readings in
+  the window that form its run of detected readings** -- a data-completeness
   measure, not a claim about how "sure" Video-Lens is about anything
   semantic.
 - `Inference.confidence` and `VisionObservation`/`PointerEvent.confidence`

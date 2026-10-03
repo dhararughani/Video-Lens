@@ -58,10 +58,12 @@ def test_package_is_valid_and_carries_schema_version():
     validate_knowledge_package(package)  # must not raise
     assert package.processing.knowledge_schema_version == KNOWLEDGE_SCHEMA_VERSION
     # Pinned to a literal on purpose: a package-shape change must be a
-    # deliberate edit here, never a silent one. Bumped to "1.1" by Step 11,
-    # which added the optional semantic fields (semantic_summary/claims/
-    # visual_evidence/synthesis) -- see docs/synthesis.md.
-    assert package.processing.knowledge_schema_version == "1.1"
+    # deliberate edit here, never a silent one. Bumped to "1.1" by Step 11
+    # (the optional semantic fields: semantic_summary/claims/visual_evidence/
+    # synthesis -- see docs/synthesis.md), then to "1.2" by P1-B (the
+    # visual_change / cursor_track evidence kinds and the optional
+    # visual_changes / cursor_intelligence fields -- see docs/evidence.md).
+    assert package.processing.knowledge_schema_version == "1.2"
 
 
 def test_schema_version_is_independent_of_software_version():

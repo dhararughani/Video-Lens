@@ -79,12 +79,175 @@ boundary. Timestamps outside the video's range are clamped this way rather
 than rejected; only a negative or non-finite timestamp is a `ValueError`. A
 missing/unreadable video or an ffmpeg failure raises `FrameExtractionError`.
 
+That clamp uses the **container** duration, which covers every stream. When
+the video stream ends first (audio outlasts it — by 0.35 and 1.6 frames on the
+Step 7 benchmark videos, by seconds in some recordings) the clamped timestamp is
+still past the last frame. So when ffmpeg exits cleanly but writes nothing, the
+extractor reads the video stream's packet timestamps from the last keyframe
+onward (`ffprobe -read_intervals`, headers only, ~0.1 s on a 4-minute video),
+floors the last one to milliseconds, and serves that frame, stamped with that
+timestamp. No constant is subtracted: the position is the frame's own pts,
+floored because a seek a hair *before* a frame returns it and a hair *after*
+returns nothing. The result is remembered per video, so later requests clamp
+straight to it; a request that succeeds never probes. If the probe can't
+explain the failure (no timestamps, or an end not before the request), the
+original error is raised. Pinned in `tests/test_benchmark_findings.py`
+(both mismatch directions, a 30 fps last frame between milliseconds, windows
+crossing the end).
+
 ## Frame windows (`FrameExtractor.extract_window`)
 
 `extract_window(video, start_sec, end_sec, interval_sec)` samples uniformly
 across a range. Validates `end_sec > start_sec` and `interval_sec > 0`
 (`ValueError` otherwise). Requested timestamps that clamp to the same
 instant near the video's end collapse to one frame — no duplicates.
+
+## Targeted inspection (`video_lens.inspect_visual_evidence`)
+
+A first-class "look closely here" request, built on the same `FrameExtractor`
+and cache rather than a second extraction path:
+
+```python
+from core.contracts import InspectionRequest, Region
+from video_lens import inspect_visual_evidence
+
+result = inspect_visual_evidence(video, InspectionRequest(
+    timestamp_sec=42.0, window_before_sec=1.0, window_after_sec=1.0, fps=4.0,
+    scale_width=640, region=Region(0.5, 0.0, 1.0, 0.5)))
+result.frames   # tuple[Frame, ...], ordered by time, each with its own provenance
+```
+
+- **No window** (`window_before_sec == window_after_sec == 0`): the single
+  frame at `timestamp_sec`. **Window**: frames from `timestamp - before`
+  through `timestamp + after` at `fps`, clamped to `[0, duration]` — a window
+  that collapses against the end of the video returns the one clamped frame.
+  A window **requires** `fps` (`InspectionRequest` rejects it otherwise): there
+  is no sensible implicit density, and guessing one would make a request's cost
+  unpredictable.
+- **`region`** is the existing normalized `Region`, converted to pixels against
+  the source frame and rounded *outward* to even pixels so the crop never cuts
+  off part of the requested area. Even alignment is required, not cosmetic:
+  ffmpeg silently rounds a crop on a chroma-subsampled format (e.g. yuv420p)
+  down to even dimensions (`crop=41:23` really yields 40x22), which would make
+  the size reported on the `Frame` disagree with its pixels.
+- **`scale_width`** sets the output width; height follows the (cropped) aspect
+  ratio, rounded half-up, and is passed to ffmpeg explicitly so the reported
+  size is exact.
+- **One ffmpeg pass**: `-vf crop=...,scale=...`, crop first; the scale also
+  does the colour conversion below, so every request has exactly one `-vf`.
+  A request with neither option is the original command plus that conversion
+  only, and on an ordinary (BT.601/untagged) source its output is byte-for-byte
+  what it was before (pinned by a regression test).
+- **Colour**: a JPEG is BT.601 full-range by definition, and ffmpeg converts
+  only the range, not the matrix, when writing one, so a BT.709 source's colours
+  were shifted (MAD 9.6/255, up to 48 on a channel, on the Step 7 tutorial).
+  The chain ends in `scale=out_color_matrix=bt601:out_range=full` with
+  `accurate_rnd+full_chroma_int+full_chroma_inp`; the input matrix is read from
+  each frame's own colour metadata (BT.709 is converted, BT.601 untouched,
+  untagged read as BT.601 exactly like ffmpeg's own RGB decode). The flags
+  matter: at default rounding the conversion has a 1–2 level bias that made
+  neutral BT.709 content *worse* than before. Against an exact float decode of
+  the raw YUV, mean error on the benchmark videos went 5.5–8.0 → 1.0–1.2
+  (saturated) and 0.5–0.8 → 0.4–0.6 (neutral).
+- **`Frame.width`/`height` are the OUTPUT dimensions** for a cropped/scaled
+  frame, not the source's.
+- Default storage is the extractor's own temp-dir cache — disposable like every
+  other Video-Lens cache. Pass an `extractor` to scope it.
+
+Known limitations: crop coordinates use `VideoInput.width/height` (the stream's
+coded size, as ingestion reports it), so a source carrying rotation metadata —
+which ffmpeg auto-rotates on decode — would map a region against swapped axes;
+ingestion does not handle rotation today, so neither does this. There is no
+ceiling on `fps × window`; a very dense request is many ffmpeg invocations.
+
+## Temporal visual change (`core.visual_change`)
+
+Deterministic measurement of how much the picture changed between two sampled
+frames, and where. **Not an interpretation.** Since knowledge schema `1.2` its
+output is first-class evidence: `core.evidence.visual_change_to_evidence` maps
+each event to `Evidence(kind="visual_change")` (see `docs/evidence.md`,
+"Measured evidence"). The detector itself still knows nothing of evidence,
+knowledge or synthesis. Opt in for a whole run with
+`PipelineConfig(visual_change_enabled=True)`.
+
+**In the pipeline it has its own bounded temporal path** (Step 8), separate from
+keyframe selection, and its frames never go to vision:
+
+```
+video ─┬─ keyframes (scene + dedupe) ── vision / pointer / correlation windows
+       └─ grid 0, s, 2s, … + last decodable frame ── detect_visual_changes ── AnalysisResult.visual_changes
+```
+
+- **Grid.** `s = max(visual_change_interval_sec, duration / (visual_change_max_samples − 2))`:
+  2.0 s by default, widened so at most `visual_change_max_samples` (150) frames
+  are sampled — a 4.5-minute video takes ~136, a one-hour video gets a ~24 s step.
+  Pairs are consecutive: t0→t1, t1→t2, …, last grid point→last decodable frame.
+- **End of video.** Every timestamp goes through `FrameExtractor`, whose clamp
+  and end-of-stream rule (above) is the only one: the final sample is
+  `get_frame(duration)`, i.e. the real last frame even when the container
+  outlasts the video stream. A video shorter than one step yields one pair
+  (first vs. last frame); a one-frame video yields none and the stage is
+  recorded unavailable, never as a zero-magnitude change.
+- **Cost.** At the defaults the grid coincides with keyframe selection's own
+  interval samples, which are already in the frame cache, so a pipeline run
+  adds about one extraction (the last frame). Called alone (cold cache), it is
+  one ffmpeg seek per sample.
+- **Failure.** Any error sampling or measuring degrades the whole stage to
+  "requested, nothing measured" (`stages_unavailable`), with a warning.
+
+Why it is not the keyframes: keyframes are chosen *because* they differ, at
+irregular gaps (up to 170 s on a Step 7 benchmark video), so nearly every
+keyframe pair "changed" and the change was not localized. See docs/benchmark.md.
+
+```python
+from core.visual_change import detect_visual_changes, compare_frames
+
+frames = inspect_visual_evidence(video, InspectionRequest(
+    timestamp_sec=60, window_before_sec=30, window_after_sec=30, fps=2)).frames
+events = detect_visual_changes(frames)   # one VisualChangeEvent per consecutive pair
+```
+
+- **Magnitude (L1)**: the fraction of frame area whose luma changed by more than
+  25/255 — the same per-pixel rule as the pointer detector, now shared from
+  `core.visual_change.changed_pixel_mask` so the two can't drift. In `[0, 1]`.
+- **Threshold**: detected when `magnitude >= threshold` (**`>=`**, inclusive).
+  Default `0.08`, measured rather than assumed: on a real talking-head video
+  sampled 0.5s apart, natural presenter motion has p95 = 0.064, so 0.08 sits
+  just above continuous motion (on 60s of that video: 0 of 120 pairs flagged),
+  while on a real screen recording it flags 46 of 120 genuine transitions. It
+  therefore **misses small localized changes** — a tooltip is ~0.5% of a frame.
+  For clean screen recordings, where measured codec noise is ~0 (55% of
+  consecutive 1080p pairs score exactly 0), pass a lower threshold such as
+  `0.005`. What counts as meaningful also depends on the sampling interval:
+  the same content changes more between frames 2s apart than 0.5s apart.
+- **Regions (L2)**: when detected, changed pixels are grouped (blobs within
+  ~1% of the longer side merge — a line of text is one change) and each group
+  becomes a normalized `Region` that tightly bounds the *actually changed*
+  pixels. Groups under 0.05% of the frame are dropped as specks; if only specks
+  exist, one region bounds them all (a diffuse change). At most 8 regions are
+  reported, largest first, and `detail` says when more existed.
+- **Localized vs global**: decided by *extent*, not amount — `global` when the
+  regions cover >= 50% of the frame. A side panel changing 40% of the width is
+  localized; a scroll touching scattered pixels everywhere is global.
+- **Timestamps**: `timestamp_sec` is the **later** frame's time (the first
+  moment the new state is observed); `compared_timestamps` records both. The
+  change happened somewhere in `(earlier, later]` — no finer precision than
+  the sampling interval is claimed.
+- **Unavailable is never "no change"**: an unreadable frame, frames of
+  different sizes (never resampled — that would manufacture differences), or a
+  missing OpenCV give `status="unavailable"` with `magnitude=None` and a
+  plain-language `detail`. Out-of-order frames raise rather than being
+  re-sorted.
+- **Cost**: linear in frames, each read once; ~70 ms/pair at 1080p and ~9 ms at
+  720p on this machine (CPU only).
+
+**Deliberately not detected**: what a change *means*. "Scroll", "zoom",
+"redraw", "annotation", "page transition" are future classification work. Also
+not detected: subtle brightness drift below the per-pixel rule, pure hue
+changes at equal luma (grayscale comparison — the same trade-off as
+de-duplication), and anything between two samples that reverts before the
+next. A webcam overlay or presenter in frame is genuine visual change and is
+reported as such; telling it apart from content change is interpretation.
 
 ## Speech -> frame bridge (`frames_for_segment`)
 
@@ -148,9 +311,18 @@ under the OS temp dir). Every `get_frame`/`extract_window` call is cached —
 no separate "enable caching" flag, because re-decoding the same instant
 twice has no value.
 
-- **Key**: `sha1(abs_path : mtime_ns : size : timestamp_ms)`, filename
-  `<hash>.jpg`. Path + mtime + size means a modified or replaced video file
-  produces a new key automatically — no manual invalidation logic needed.
+- **Key**: `sha1(abs_path : mtime_ns : size : timestamp_ms :
+  FRAME_EXTRACTION_VERSION : crop : scale)`, filename `<hash>.jpg`. Path +
+  mtime + size means a modified or replaced video file produces a new key
+  automatically — no manual invalidation logic needed. The last three parts
+  are what was done to the pixels (see "Targeted inspection" below): a cached
+  full-resolution frame is never returned for a request that asks for a
+  different crop or width. `crop`/`scale` are the *resolved integer*
+  rectangle and size, not the raw request, so two requests that produce the
+  same image share one entry and two that don't can't collide.
+  `FRAME_EXTRACTION_VERSION` (currently `"3"`, since the colour conversion) is bumped whenever the meaning
+  of a key would change; entries written before it existed carried no version,
+  so they can never match and are simply orphaned in the disposable cache.
 - **Reuse**: if the cache file exists **and is non-empty**, it's returned
   as-is. A cached file left at 0 bytes by a killed-mid-write process is
   **not** trusted — it gets regenerated. (Found and fixed during this step:

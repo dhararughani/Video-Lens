@@ -25,6 +25,7 @@ import shutil
 from dataclasses import replace
 
 from core.contracts import Claim, Evidence, KeyPoint, VisualEvidence
+from core.evidence import NATIVE_VIDEO_SOURCE
 
 # Hamming distance between two 64-bit dHashes below which two frames are
 # treated as the same visual. 6/64 bits tolerates JPEG noise and a moving
@@ -139,7 +140,7 @@ def _demand(claims: tuple[Claim, ...], key_points: tuple[KeyPoint, ...],
         for ev in claim.supporting_evidence:
             if ev.kind == "frame" and ev.ref in id_by_path:
                 want(id_by_path[ev.ref], claim.confidence, "cited by a verified semantic claim")
-            elif ev.kind == "vision":
+            elif ev.kind == "vision" and ev.source != NATIVE_VIDEO_SOURCE:
                 # `vision` Evidence.ref is the model's description text, not a
                 # frame path -- the interpreted frame is recovered by
                 # timestamp so a genuinely corroborated claim still ships
@@ -247,7 +248,7 @@ def select_and_bundle(
     def _candidate_id(ev: Evidence) -> str | None:
         if ev.kind == "frame":
             return id_by_path.get(ev.ref)
-        if ev.kind == "vision":
+        if ev.kind == "vision" and ev.source != NATIVE_VIDEO_SOURCE:
             return _frame_id_at(ev.timestamp_sec, candidates)
         return None
 

@@ -218,13 +218,13 @@ def test_vision_region_without_pointer_confirmation_is_a_disagreement():
     assert any("no pointer evidence" in d for d in so.disagreements)
 
 
-def test_speech_while_pointer_stationary():
+def test_speech_while_pointer_barely_moves_is_never_called_stationary():
+    """Step 8: a motion-based detector cannot establish stillness, so a tiny
+    displacement yields no speech/pointer inference at all (was "stationary")."""
     transcript = Transcript(segments=[TranscriptSegment(start_sec=4.6, end_sec=5.4, text="see this")])
     pointers = [_pointer(4.7, 960, 540), _pointer(5.3, 962, 541)]  # tiny movement
     so = build_structured_observation(5.0, transcript=transcript, pointer_events=pointers, tolerance_sec=1.0)
-    motion_inf = [i for i in so.inferences if i.basis.startswith("speech_pointer")]
-    assert len(motion_inf) == 1
-    assert motion_inf[0].basis == "speech_pointer_stationary"
+    assert not any(i.basis.startswith("speech_pointer") for i in so.inferences)
 
 
 def test_speech_while_pointer_moving():
@@ -342,7 +342,7 @@ if __name__ == "__main__":
     test_pointer_in_vision_region_produces_inference_with_citations()
     test_pointer_outside_all_regions_is_a_disagreement_not_an_inference()
     test_vision_region_without_pointer_confirmation_is_a_disagreement()
-    test_speech_while_pointer_stationary()
+    test_speech_while_pointer_barely_moves_is_never_called_stationary()
     test_speech_while_pointer_moving()
     test_single_pointer_reading_does_not_claim_motion_or_stationary()
     test_inference_never_appears_in_observed()

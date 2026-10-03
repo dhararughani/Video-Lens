@@ -292,6 +292,24 @@ Claim
 it can never name an image the package doesn't ship — an invariant
 `validate_knowledge_package` enforces.
 
+## Schema 1.2: measured evidence in claims
+
+`visual_change` and `cursor_track` are valid evidence a claim may cite (the
+brief shows detected changes and moving cursor segments; quiet intervals stay
+out, like un-contributing pointer readings). They are **measurements**: they
+establish that the picture changed or the pointer moved, never what changed, why
+or what the user did. So verification treats them as follows:
+
+- a claim citing **only** measurements is never `observed` -- the provider's
+  `"observed"` is recorded as `inferred`, verification `measurement_evidence_only`;
+- with speech it is `speech_evidence_with_measured_change`; with a vision
+  description the existing labels apply, unchanged;
+- whenever a measurement is cited, the claim's `limitations` say what a
+  measurement cannot establish.
+
+Existing claims verify exactly as before. Cited evidence keeps its `source` and
+`timestamp_end_sec` through verification.
+
 ## Trying it
 
 `scripts/synthesis_smoke_test.py` runs the whole thing on a real video and

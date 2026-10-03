@@ -36,6 +36,10 @@ VERSION = "1.0.0"  # software release -- see KNOWLEDGE_SCHEMA_VERSION in core/co
                     # for the independently-versioned package *shape*
 
 _ALL_STAGES = ("transcript", "frame", "pointer", "vision")
+# Schema 1.2's opt-in measurement streams. Unlike _ALL_STAGES they are NOT
+# expected of every run, so they count as unavailable only when a run asked for
+# one and got nothing -- a default run never lists them as missing.
+_OPTIONAL_STAGES = ("visual_change", "cursor_track")
 
 # (kind, cue phrases) -- checked in order, first match wins per segment.
 # Free text, no domain vocabulary (see docs/architecture.md's "What was
@@ -130,14 +134,31 @@ def _extract_important_observations(structured_observations) -> list[KeyPoint]:
     return points
 
 
-def _stage_coverage(structured_observations) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    available = set()
-    unavailable = set(_ALL_STAGES)
+def _stage_coverage(structured_observations, streams=()) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """`streams`: evidence collected outside the windows (AnalysisResult.visual_changes)."""
+    available = {e.kind for e in streams}
+    unavailable = set(_ALL_STAGES) - available
     for so in structured_observations:
         for e in so.observed:
             available.add(e.kind)
             unavailable.discard(e.kind)
+    # an optional stage is recorded as unavailable only if it was configured
+    # (the observation says so) and never produced evidence anywhere
+    unavailable |= {name for so in structured_observations for name in so.unavailable
+                    if name in _OPTIONAL_STAGES} - available
     return tuple(sorted(available)), tuple(sorted(unavailable))
+
+
+def _collect_kind(structured_observations, kind: str, stream=()) -> tuple[Evidence, ...]:
+    """Every distinct evidence item of `kind`, in time order, from the windows
+    and from a whole-video `stream` of the same kind. Windows overlap and are a
+    subset of the stream, so the same measurement is observed several times --
+    it appears here once."""
+    seen: dict[tuple, Evidence] = {}
+    for e in (*stream, *(e for so in structured_observations for e in so.observed)):
+        if e.kind == kind:
+            seen.setdefault((e.timestamp_sec, e.timestamp_end_sec, e.ref, e.source), e)
+    return tuple(sorted(seen.values(), key=lambda e: (e.timestamp_sec, e.timestamp_end_sec or 0.0)))
 
 
 def _synthesis_limitations(synthesis) -> list[str]:
@@ -170,7 +191,7 @@ def _synthesis_limitations(synthesis) -> list[str]:
 
 
 def _limitations(transcript, structured_observations, stages_unavailable: tuple[str, ...],
-                  synthesis=None) -> tuple[str, ...]:
+                  synthesis=None, visual_changes=()) -> tuple[str, ...]:
     notes = [
         "Topics, key lessons and `summary` are extracted via deterministic keyword/cue-phrase "
         "matching against the transcript, not semantic language understanding -- "
@@ -189,6 +210,18 @@ def _limitations(transcript, structured_observations, stages_unavailable: tuple[
         notes.append("No pointer/cursor evidence was found -- this may mean no cursor was "
                       "on screen, or a stationary cursor produced no motion signal (see "
                       "docs/pointer.md); absence of pointer evidence is not proof of absence.")
+    if visual_changes:
+        notes.append("Visual-change items measure how much of the picture changed between the two "
+                      "frames in each item's `compared` interval -- pixels, not meaning: a presenter "
+                      "moving, a scene cut and a UI change all register alike. Only those frames were "
+                      "compared, so a change that reverted between them is not seen, and a change "
+                      "is not localized within the interval.")
+    if "visual_change" in stages_unavailable:
+        notes.append("Visual-change detection was requested but produced no measurement -- "
+                      "absence of a recorded change is not proof the picture did not change.")
+    if "cursor_track" in stages_unavailable:
+        notes.append("Cursor-movement analysis was requested but produced no segments -- "
+                      "absence of movement evidence is not proof the cursor was still.")
     return tuple(notes)
 
 
@@ -231,7 +264,10 @@ def build_knowledge_package(result: AnalysisResult, transcript=None,
     key_lessons = _extract_key_lessons(transcript)
     topics = _extract_topics(transcript)
     important_observations = _extract_important_observations(result.structured_observations)
-    stages_available, stages_unavailable = _stage_coverage(result.structured_observations)
+    stages_available, stages_unavailable = _stage_coverage(result.structured_observations,
+                                                           result.visual_changes)
+    visual_changes = _collect_kind(result.structured_observations, "visual_change", result.visual_changes)
+    cursor_intelligence = _collect_kind(result.structured_observations, "cursor_track")
 
     claims = synthesis.claims if synthesis is not None else ()
 
@@ -239,7 +275,7 @@ def build_knowledge_package(result: AnalysisResult, transcript=None,
     seen = set()
     for kp in (*key_lessons, *important_observations, *claims):
         for e in kp.supporting_evidence:
-            key = (e.timestamp_sec, e.kind, e.ref)
+            key = (e.timestamp_sec, e.kind, e.ref, e.source)
             if key not in seen:
                 seen.add(key)
                 cited_evidence.append(e)
@@ -255,10 +291,12 @@ def build_knowledge_package(result: AnalysisResult, transcript=None,
         important_observations=tuple(important_observations),
         evidence=tuple(cited_evidence),
         limitations=_limitations(transcript, result.structured_observations, stages_unavailable,
-                                  synthesis),
+                                  synthesis, visual_changes),
         semantic_summary=synthesis.summary if synthesis is not None else None,
         claims=claims,
         synthesis=synthesis.metadata if synthesis is not None else None,
+        visual_changes=visual_changes,
+        cursor_intelligence=cursor_intelligence,
         processing=ProcessingMetadata(
             generated_at=datetime.now(timezone.utc).isoformat(),
             video_lens_version=VERSION,
@@ -331,7 +369,16 @@ def validate_knowledge_package(package: KnowledgePackage) -> None:
 
     # A package is a knowledge artifact: excerpts cite, they don't archive, and
     # image bytes live in the bundle as files rather than inline.
-    for ev in package.evidence:
+    for field_name, kind in (("visual_changes", "visual_change"), ("cursor_intelligence", "cursor_track")):
+        for ev in getattr(package, field_name):
+            if ev.kind != kind:
+                raise KnowledgePackageError(
+                    f"{field_name} may only hold {kind!r} evidence, found {ev.kind!r}")
+            if not (0.0 <= ev.timestamp_sec <= source.duration_sec + 1.0):
+                raise KnowledgePackageError(
+                    f"{field_name} timestamp {ev.timestamp_sec} falls outside source "
+                    f"duration {source.duration_sec}")
+    for ev in (*package.evidence, *package.visual_changes, *package.cursor_intelligence):
         if ev.kind != "frame" and len(ev.ref) > _MAX_EVIDENCE_REF:
             raise KnowledgePackageError(
                 f"evidence excerpt of {len(ev.ref)} chars exceeds the {_MAX_EVIDENCE_REF}-char "

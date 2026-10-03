@@ -12,6 +12,7 @@ import subprocess
 from scenedetect import SceneManager, open_video
 from scenedetect.detectors import ContentDetector
 
+from adapters.frames.frame_extractor import JPEG_COLOR_FILTER
 from core.contracts import Frame, VideoInput
 
 
@@ -41,7 +42,8 @@ class SceneDetectFrameAdapter:
             out_path = os.path.join(out_dir, f"frame_{i:04d}.jpg")
             subprocess.run(
                 ["ffmpeg", "-y", "-ss", str(ts), "-i", video.path,
-                 "-frames:v", "1", "-q:v", "2", "-pix_fmt", "yuvj420p", out_path],
+                 "-frames:v", "1", "-q:v", "2", "-vf", f"scale={JPEG_COLOR_FILTER}",
+                 "-pix_fmt", "yuvj420p", out_path],
                 capture_output=True, check=True,
             )
             frames.append(Frame(

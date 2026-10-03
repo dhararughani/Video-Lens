@@ -25,3 +25,10 @@ class KnowledgePackageError(Exception):
     package -- is what keeps the cleanup safety gate closed: process_video
     never calls JobWorkspace.mark_success() if this is raised."""
     pass
+
+
+class SessionError(Exception):
+    """An evidence session could not be saved or loaded: malformed or corrupt
+    file, unsupported format version, or an unsafe/duplicate write target
+    (see docs/session.md)."""
+    pass

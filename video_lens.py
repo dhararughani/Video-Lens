@@ -32,6 +32,7 @@ provider dependency whatsoever. See docs/vision.md, "Provider model".
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 from dataclasses import dataclass, replace
@@ -39,17 +40,23 @@ from dataclasses import dataclass, replace
 from adapters.frames.frame_extractor import FrameExtractor
 from adapters.frames.keyframe_selector import select_keyframes
 from adapters.ingestion import ingest
-from adapters.pointer.cursor_detector import detect_pointer_at
+from adapters.pointer.cursor_detector import detect_pointer_at, track_pointer
 from adapters.transcription.faster_whisper_adapter import FasterWhisperAdapter
-from core.contracts import AnalysisResult, Frame, KnowledgePackage, PointerEvent, Transcript, VisionObservation
+from core.contracts import (
+    AnalysisResult, CursorSegment, Frame, InspectionRequest, InspectionResult, KnowledgePackage,
+    PointerEvent, PointerTrack, Transcript, VideoInput, VisionObservation, VisualChangeEvent,
+)
+from core.cursor_intelligence import DEFAULT_MAX_INTERVAL_SEC, analyze_track
 from core.errors import FrameExtractionError, TranscriptionError
 from core.evidence import build_analysis_result
-from core.interfaces import KnowledgeSynthesizer, VisionAdapter
+from core.interfaces import KnowledgeSynthesizer, VideoUnderstandingAdapter, VisionAdapter
 from core.knowledge import (
     build_knowledge_package, default_filename_stem, export_knowledge_package,
     knowledge_source_for, validate_knowledge_package,
 )
+from core.session import build_session, save_session, session_filename
 from core.synthesis import build_synthesis_brief, synthesize, unavailable
+from core.visual_change import detect_visual_changes
 from core.visual_evidence import select_and_bundle
 from core.workspace import JobWorkspace
 
@@ -77,7 +84,8 @@ class PipelineConfig:
     # frame selection (adapters/frames/keyframe_selector.py)
     keyframe_interval_sec: float = 2.0
     keyframe_diff_threshold: float = 10.0
-    max_frames: int = 20  # ceiling on frames sent through pointer/vision -- keeps cost bounded on long videos
+    max_frames: int = 20  # ceiling on frames sent through pointer/vision -- keeps cost bounded on long videos;
+    # over budget, the kept frames are spread evenly across the candidates (_spread), never the first N
 
     # optional stages
     pointer_enabled: bool = True
@@ -100,6 +108,34 @@ class PipelineConfig:
     # itself just one more implementation of this same interface. See
     # docs/vision.md "Provider model".
     vision_provider: VisionAdapter | None = None
+    # Optional SIBLING to vision_provider, not a replacement: any object
+    # implementing core.interfaces.VideoUnderstandingAdapter
+    # (`analyze_video(video, *, transcript, start_sec, end_sec, prompt)`) -- a
+    # model that reasons over the video itself and returns timestamped
+    # observations, including moments Video-Lens never sampled as frames.
+    # None (default) -> never called: no calls, no network, no added cost.
+    # Supplying one is the opt-in; it runs independently of vision_enabled.
+    # Video-Lens ships no implementation (see docs/vision.md).
+    video_understanding_provider: VideoUnderstandingAdapter | None = None
+
+    # Schema 1.2 deterministic measurements, both OFF by default (a default run
+    # is unchanged). Each becomes `visual_change` / `cursor_track` evidence on
+    # the package. Measurements, not interpretations.
+    # visual_change_enabled: P0-B on its OWN bounded temporal grid -- every
+    # visual_change_interval_sec from 0 to the last decodable frame, never the
+    # selected keyframes (chosen because they differ, at gaps up to 170s on a
+    # benchmark video). The step widens so a video never exceeds
+    # visual_change_max_samples frames. Grid frames are only measured, never
+    # sent to vision. At the defaults the grid coincides with keyframe
+    # selection's own interval samples, already in the frame cache.
+    # cursor_intelligence_enabled: segment the pipeline's own pointer events
+    # (needs pointer_enabled) into moving/uncertain stretches (P0-C); keyframes
+    # are seconds apart, so expect mostly "uncertain" -- for dense tracking call
+    # analyze_cursor_motion directly.
+    visual_change_enabled: bool = False
+    visual_change_interval_sec: float = 2.0
+    visual_change_max_samples: int = 150  # 2s covers ~5 min; longer videos get a wider step
+    cursor_intelligence_enabled: bool = False
 
     # evidence correlation (core/evidence.py)
     tolerance_sec: float = 1.0
@@ -127,6 +163,13 @@ class PipelineConfig:
     # content decide", not "unbounded". See core/visual_evidence.py.
     max_visual_evidence: int | None = None
 
+    # Opt-in evidence session (process_video only -- see docs/session.md). None
+    # (default) -> nothing is persisted and the run is exactly as before. A
+    # directory -> after the package is written, the run's OBSERVATIONS
+    # (transcript + evidence, no media, no frames, no conclusions) are saved
+    # there as `<name>-<hash>.session.json`. Temp-artifact cleanup is unchanged.
+    session_dir: str | None = None
+
 
 def analyze_video(source: str, config: PipelineConfig | None = None) -> AnalysisResult:
     """Run the canonical Video-Lens pipeline on a local file path or a URL.
@@ -139,6 +182,59 @@ def analyze_video(source: str, config: PipelineConfig | None = None) -> Analysis
     """
     result, _transcript = _run_pipeline(source, config or PipelineConfig())
     return result
+
+
+def inspect_visual_evidence(video: VideoInput, request: InspectionRequest,
+                             extractor: FrameExtractor | None = None) -> InspectionResult:
+    """Look closely at one moment, or a window around it, of an already-ingested
+    video -- optionally cropped to a `Region` and downscaled -- without running
+    the pipeline. This is the targeted counterpart to the whole-video survey
+    `analyze_video` does, for when something specific needs a second look.
+
+    A request with no window yields the single frame at `request.timestamp_sec`;
+    one with a window yields frames from `timestamp - window_before_sec` through
+    `timestamp + window_after_sec` at `request.fps`, clamped to the video's
+    duration. Everything goes through the same `FrameExtractor` (and cache) the
+    pipeline uses, so a repeated or overlapping inspection never re-extracts a
+    frame it already has. Pass your own `extractor` to control where frames are
+    cached; by default that is the extractor's own temp directory, which is
+    disposable like every other Video-Lens cache -- nothing here creates
+    durable media storage.
+
+    Raises `FrameExtractionError` (the missing-file / ffmpeg-failure error the
+    pipeline's own frame stage raises) if frames cannot be extracted."""
+    extractor = extractor or FrameExtractor()
+    options = {"scale_width": request.scale_width, "region": request.region}
+
+    start = max(0.0, request.timestamp_sec - request.window_before_sec)
+    end = min(request.timestamp_sec + request.window_after_sec, video.duration_sec)
+    if request.fps is None or end <= start:
+        # No window requested, or the window collapsed against the end of the
+        # video: the one frame at the requested moment (get_frame clamps it).
+        frames = [extractor.get_frame(video, request.timestamp_sec, **options)]
+    else:
+        frames = extractor.extract_window(video, start, end, 1.0 / request.fps, **options)
+    return InspectionResult(request=request, frames=tuple(frames), video_source=video.path)
+
+
+def analyze_cursor_motion(video: VideoInput, start_sec: float, end_sec: float,
+                          extractor: FrameExtractor | None = None, interval_sec: float = 0.5,
+                          max_interval_sec: float = DEFAULT_MAX_INTERVAL_SEC,
+                          ) -> tuple[PointerTrack, tuple[CursorSegment, ...]]:
+    """Track the pointer across `[start_sec, end_sec]` and say what that
+    establishes about its movement: the existing `track_pointer` (frames every
+    `interval_sec`, three-frame differencing), then
+    `core.cursor_intelligence.analyze_track`.
+
+    Returns the raw `PointerTrack` (every sample, for provenance) and its
+    `CursorSegment`s, which tile the whole range as "moving" or "uncertain".
+    There is no "stationary": the detector sees a cursor only while it moves,
+    so stillness is never something the evidence can establish (see
+    docs/pointer.md). Opt-in and standalone -- `analyze_video` does not call
+    this, so default pipeline behavior and cost are unchanged."""
+    extractor = extractor or FrameExtractor()
+    track = track_pointer(video, start_sec, end_sec, extractor, interval_sec=interval_sec)
+    return track, analyze_track(track, max_interval_sec=max_interval_sec)
 
 
 def _run_pipeline(source: str, config: PipelineConfig) -> tuple[AnalysisResult, Transcript | None]:
@@ -159,14 +255,33 @@ def _run_pipeline(source: str, config: PipelineConfig) -> tuple[AnalysisResult, 
     if config.vision_enabled and frames:
         vision_observations = _analyze_vision(frames, transcript, pointer_events, config)
 
+    video_observations: list[VisionObservation] | None = None
+    if config.video_understanding_provider is not None:
+        video_observations = _analyze_video_understanding(video, transcript, config)
+
+    visual_changes: list[VisualChangeEvent] | None = None
+    if config.visual_change_enabled:
+        visual_changes = _measure_visual_changes(video, extractor, config)
+
+    cursor_segments: tuple[CursorSegment, ...] | None = None
+    if config.cursor_intelligence_enabled:
+        cursor_segments = _measure_cursor_motion(pointer_events)
+
     query_timestamps = [f.timestamp_sec for f in frames]
     if not query_timestamps and transcript is not None:
         query_timestamps = [s.start_sec for s in transcript.segments]
+    if video_observations:
+        # Each usable native observation gets a correlation window at its own
+        # moment, so evidence about a moment no frame was sampled at is kept,
+        # not dropped for lack of a nearby frame.
+        query_timestamps = sorted(set(query_timestamps) | {
+            o.timestamp_sec for o in video_observations if o.status in ("ok", "low_information")})
 
     result = build_analysis_result(
         video, query_timestamps, transcript=transcript, frames=frames,
         pointer_events=pointer_events, vision_observations=vision_observations,
-        tolerance_sec=config.tolerance_sec,
+        video_observations=video_observations, visual_changes=visual_changes,
+        cursor_segments=cursor_segments, tolerance_sec=config.tolerance_sec,
     )
     return result, transcript
 
@@ -178,7 +293,8 @@ def process_video(source: str, config: PipelineConfig | None = None) -> Knowledg
     job owns (job-downloaded video, extracted frames, vision cache) --
     never the caller's own local source file, which always lives outside
     the job workspace. If anything fails before the package is written,
-    nothing is cleaned up -- see docs/lifecycle.md.
+    nothing is cleaned up -- see docs/lifecycle.md -- and the exception
+    carries the preserved workspace's path as `workspace_root`.
 
     Use this for standalone "give me a video, get me knowledge" usage.
     Use `analyze_video` directly if you want the full evidence-level
@@ -186,6 +302,16 @@ def process_video(source: str, config: PipelineConfig | None = None) -> Knowledg
     """
     config = config or PipelineConfig()
     workspace = JobWorkspace()
+    try:
+        return _process_in(source, config, workspace)
+    except BaseException as e:
+        # cleanup() never ran, so the temp tree is still there for inspection --
+        # say where, so a caller (e.g. video_lens_worker) can report it.
+        e.workspace_root = workspace.root
+        raise
+
+
+def _process_in(source: str, config: PipelineConfig, workspace: JobWorkspace) -> KnowledgePackage:
     job_config = replace(config, frame_cache_dir=workspace.frame_cache_dir,
                           vision_cache_dir=workspace.vision_cache_dir,
                           download_dir=workspace.download_dir)
@@ -229,11 +355,32 @@ def process_video(source: str, config: PipelineConfig | None = None) -> Knowledg
     # handoff artifact known to exist, which is what mark_success()/cleanup()
     # below are gated on.
 
+    if config.session_dir is not None:
+        session = build_session(result, transcript, analysis=_session_analysis(config))
+        # the file name is derived from the source, so re-analysing the same
+        # video replaces its session (atomically) and a different video can't
+        save_session(session, os.path.join(config.session_dir, session_filename(session)), overwrite=True)
+
     workspace.mark_success()
     if not config.retain_temp_artifacts:
         workspace.cleanup()
 
     return package
+
+
+def _session_analysis(config: PipelineConfig) -> dict:
+    """The configuration facts needed to read a session's evidence -- which
+    streams ran and the correlation tolerance -- as plain booleans and numbers.
+    Never a model name, credential, path or provider object."""
+    return {
+        "tolerance_sec": config.tolerance_sec, "keyframe_interval_sec": config.keyframe_interval_sec,
+        "max_frames": config.max_frames, "pointer_enabled": config.pointer_enabled,
+        "vision_enabled": config.vision_enabled, "visual_change_enabled": config.visual_change_enabled,
+        "visual_change_interval_sec": config.visual_change_interval_sec,
+        "visual_change_max_samples": config.visual_change_max_samples,
+        "cursor_intelligence_enabled": config.cursor_intelligence_enabled,
+        "video_understanding": config.video_understanding_provider is not None,
+    }
 
 
 def _vision_descriptions(result: AnalysisResult) -> dict[float, str]:
@@ -252,7 +399,100 @@ def _validate_package(package: KnowledgePackage) -> None:
     validate_knowledge_package(package)
 
 
-def _warn(stage: str, exc: Exception) -> None:
+def _analyze_video_understanding(video, transcript: Transcript | None,
+                                  config: PipelineConfig) -> list[VisionObservation]:
+    """Call the optional native-video provider and keep only what is grounded.
+
+    This is a trust boundary, like semantic synthesis: the provider is
+    supplied code. Anything it raises (an `Exception` -- never BaseException,
+    so Ctrl+C still stops the job) or returns that isn't a sequence means this
+    stream is unavailable, and the job continues without it. Each returned
+    item must be a `VisionObservation` with a finite timestamp inside the
+    video (+1.0s, the same clamping tolerance used everywhere); anything else
+    -- e.g. a whole-video summary with no real timestamp -- is dropped rather
+    than attached to some arbitrary frame. Survivors are marked
+    `analysis_metadata["evidence_source"] = "video_understanding"`; their order
+    doesn't matter, since correlation orders everything by time itself.
+
+    Warnings name the exception TYPE only: provider/SDK errors routinely embed
+    request URLs, which may be signed, and Video-Lens must not print them."""
+    provider = config.video_understanding_provider
+    try:
+        returned = provider.analyze_video(video, transcript=transcript, start_sec=0.0,
+                                          end_sec=None, prompt=None)
+    except Exception as e:  # noqa: BLE001 -- supplied code; any failure degrades, never fails the job
+        _warn("video understanding", f"the provider raised {type(e).__name__}")
+        return []
+    if not isinstance(returned, (list, tuple)):
+        _warn("video understanding",
+              f"the provider returned {type(returned).__name__}, not a sequence of VisionObservation")
+        return []
+
+    kept, dropped = [], 0
+    for o in returned:
+        ts = getattr(o, "timestamp_sec", None)
+        if not (isinstance(o, VisionObservation) and isinstance(ts, (int, float))
+                and not isinstance(ts, bool) and math.isfinite(ts)
+                and 0.0 <= ts <= video.duration_sec + 1.0):
+            dropped += 1
+            continue
+        metadata = o.analysis_metadata if isinstance(o.analysis_metadata, dict) else {}
+        kept.append(replace(o, analysis_metadata={**metadata, "evidence_source": "video_understanding"}))
+    if dropped:
+        print(f"[video_lens] video understanding: dropped {dropped} observation(s) without a "
+              f"valid timestamp inside the video -- never attached to a guessed moment", file=sys.stderr)
+    return kept
+
+
+def _temporal_samples(video, extractor: FrameExtractor, config: PipelineConfig) -> list[Frame]:
+    """The visual-change grid: 0, step, 2*step, ... plus the video's last
+    decodable frame, so the final stretch is measured too. Every timestamp goes
+    through the extractor, whose clamp/end-of-stream rule (docs/frames.md) is the
+    only one -- requests past the end collapse onto the last frame, never fail.
+    At most `visual_change_max_samples` frames: the step is widened, never the
+    budget exceeded."""
+    if config.visual_change_interval_sec <= 0 or config.visual_change_max_samples < 2:
+        raise ValueError("visual_change_interval_sec must be > 0 and visual_change_max_samples >= 2")
+    step = max(config.visual_change_interval_sec,
+               video.duration_sec / max(1, config.visual_change_max_samples - 2))
+    frames = extractor.extract_window(video, 0.0, video.duration_sec, step)
+    last = extractor.get_frame(video, video.duration_sec)
+    if last.timestamp_sec > frames[-1].timestamp_sec:
+        frames.append(last)
+    return frames
+
+
+def _measure_visual_changes(video, extractor: FrameExtractor,
+                            config: PipelineConfig) -> list[VisualChangeEvent]:
+    """P0-B over the bounded temporal grid -- independent of keyframe selection
+    (consecutive pairs t0->t1, t1->t2, ...). A failure anywhere degrades to
+    "configured, nothing measured" (recorded as unavailable), never to a
+    zero-magnitude change."""
+    try:
+        return detect_visual_changes(_temporal_samples(video, extractor, config))
+    except Exception as e:
+        _warn("visual change detection", type(e).__name__)
+        return []
+
+
+def _measure_cursor_motion(pointer_events: list[PointerEvent]) -> tuple[CursorSegment, ...]:
+    """P0-C over the pointer events the pipeline already detected -- no new
+    extraction. Fewer than two events cannot show movement: nothing is claimed
+    (an empty result is recorded as unavailable, never as a still cursor)."""
+    events = sorted(pointer_events, key=lambda e: e.timestamp_sec)
+    if len(events) < 2:
+        return ()
+    detected = sum(1 for e in events if e.status == "detected")
+    track = PointerTrack(start_sec=events[0].timestamp_sec, end_sec=events[-1].timestamp_sec,
+                         events=events, confidence=detected / len(events))
+    try:
+        return analyze_track(track)
+    except Exception as e:
+        _warn("cursor intelligence", type(e).__name__)
+        return ()
+
+
+def _warn(stage: str, exc: Exception | str) -> None:
     print(f"[video_lens] {stage} unavailable -- continuing without it: {exc}", file=sys.stderr)
 
 
@@ -272,10 +512,28 @@ def _try_select_frames(video, config: PipelineConfig) -> tuple[list[Frame], Fram
     try:
         frames = select_keyframes(video, extractor, interval_sec=config.keyframe_interval_sec,
                                    diff_threshold=config.keyframe_diff_threshold)
-        return frames[:config.max_frames], extractor
+        return _spread(frames, config.max_frames), extractor
     except FrameExtractionError as e:
         _warn("frame selection", e)
         return [], extractor
+
+
+def _spread(frames: list[Frame], limit: int) -> list[Frame]:
+    """At most `limit` of the selected keyframes, evenly spaced by position in
+    the (chronological) candidate list, first and last always kept -- not the
+    first `limit`, which analyzed only 0-64s of a 270s benchmark video. Under
+    budget: unchanged. Exact integer arithmetic, so it is deterministic.
+    ponytail: even by candidate index, not by time -- candidates are denser
+    where the video changes more (dedupe drops static stretches), so a long
+    static stretch can get no pick of its own; switch to time-targeted picks if
+    that coverage is ever needed."""
+    n = len(frames)
+    if n <= limit:
+        return list(frames)
+    if limit <= 1:
+        return list(frames[:limit])
+    # round(i * (n-1) / (limit-1)), half-up; strictly increasing since the step is >= 1
+    return [frames[(2 * i * (n - 1) + (limit - 1)) // (2 * (limit - 1))] for i in range(limit)]
 
 
 def _detect_pointer_evidence(video, frames: list[Frame], extractor: FrameExtractor,

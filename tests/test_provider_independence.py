@@ -89,7 +89,7 @@ def test_core_package_imports_without_anthropic_installed():
     checked by source inspection in test_claude_specific_code_does_not_leak_into_core_contracts)."""
     reloadable = ["core.interfaces", "core.errors", "core.evidence", "core.knowledge",
                   "core.workspace", "core.synthesis", "core.visual_evidence",
-                  "video_lens", "adapters.vision.claude_vision"]
+                  "core.visual_change", "core.cursor_intelligence", "core.session", "core.retrieval", "video_lens", "adapters.vision.claude_vision"]
     _fresh_reimport(*reloadable)
     with _block_import("anthropic"):
         import core.interfaces  # noqa: F401
@@ -99,6 +99,10 @@ def test_core_package_imports_without_anthropic_installed():
         import core.workspace  # noqa: F401
         import core.synthesis  # noqa: F401
         import core.visual_evidence  # noqa: F401
+        import core.visual_change  # noqa: F401
+        import core.cursor_intelligence  # noqa: F401
+        import core.session  # noqa: F401
+        import core.retrieval  # noqa: F401
         import video_lens  # noqa: F401
         # even the Claude adapter module itself must import cleanly -- it
         # only imports anthropic lazily, inside a function, when actually used
@@ -213,7 +217,8 @@ def test_claude_specific_code_does_not_leak_into_core_contracts():
     repo_root = Path(__file__).resolve().parent.parent
     for relative in ("core/contracts.py", "core/interfaces.py", "core/errors.py",
                       "core/evidence.py", "core/workspace.py", "core/synthesis.py",
-                      "core/visual_evidence.py"):
+                      "core/visual_evidence.py", "core/visual_change.py",
+                      "core/cursor_intelligence.py", "core/session.py", "core/retrieval.py"):
         src = (repo_root / relative).read_text(encoding="utf-8").lower()
         assert "anthropic" not in src, f"{relative} references anthropic"
         assert "claude" not in src, f"{relative} references claude"

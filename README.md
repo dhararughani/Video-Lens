@@ -1,8 +1,12 @@
 # Video-Lens
 
+<p align="center">
+  <img src="assets/videolens-logo.png" alt="VideoLens logo" width="220">
+</p>
+
 **Give your AI the ability to watch videos.**
 
-[![tests](https://img.shields.io/badge/tests-209%20passing-brightgreen)](#verification)
+[![tests](https://img.shields.io/badge/tests-477%20passing-brightgreen)](#verification)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](requirements.txt)
 
@@ -215,7 +219,7 @@ from video_lens import PipelineConfig
 config = PipelineConfig(
     whisper_model_size="base",       # or "small"/"medium"/"large-v3" for more accuracy
     keyframe_interval_sec=2.0,       # frame-selection density
-    max_frames=20,                   # ceiling on frames sent through pointer/vision
+    max_frames=20,                   # ceiling on frames sent through pointer/vision (spread over the video)
     pointer_enabled=True,
     vision_enabled=True,             # set False to skip vision-provider calls entirely
     vision_model=None,               # None -> the provider's own default model
@@ -231,6 +235,14 @@ result = analyze_video("video.mp4", config)
 `vision_provider` is the seam for swapping in a different backend (OpenAI,
 Gemini, a local VLM, a test fake) without changing any core contract — see
 `docs/vision.md`, "Provider model."
+
+### Filesystem worker
+
+To process videos as jobs dropped into a directory, run
+`python video_lens_worker.py ROOT`. It claims each `ROOT/inbox/<id>.json`,
+calls `process_video()` and publishes the result to `ROOT/done/<id>/` or
+`ROOT/failed/<id>/`, with a `status.json`. It is filesystem only: no queue
+and no database. See `docs/worker.md`.
 
 ### Individual adapters (advanced use)
 
@@ -422,6 +434,9 @@ not "tests pass," but what was actually inspected against real output.
   schema-version and validation contract, storage measurements, and the
   generic handoff/export contract (any downstream system is a possible
   consumer of it, not a dependency).
+- `docs/worker.md` — the thin filesystem worker: directory layout, job and
+  status format, failure, duplicate and restart behavior, and its
+  concurrency scope.
 
 ## Verification
 
@@ -458,6 +473,8 @@ library, not a service.
 - `video_lens.py` — **the public API**: `process_video()` (Step 9
   lifecycle, recommended), `analyze_video()` (raw evidence-level pipeline),
   `PipelineConfig`. Import from here for normal use.
+- `video_lens_worker.py` — the thin filesystem worker around
+  `process_video()` (`docs/worker.md`).
 - `core/` — data contracts (`contracts.py`), adapter interfaces
   (`interfaces.py`, `Protocol`s), `errors.py`, and shared mechanisms:
   `video_metadata.py` (ffprobe metadata every adapter needs),

@@ -58,8 +58,8 @@ decide what a knowledge system should durably REMEMBER about this video, and \
 to tie every retained claim to the evidence that supports it.
 
 You are given numbered evidence items drawn from the video: speech (with \
-timestamps), visual frame references, visual descriptions, and pointer/cursor \
-observations. Each item has an id like "e7". These ids are the ONLY evidence \
+timestamps), visual frame references, visual descriptions, pointer/cursor \
+observations, and deterministic measurements. Each item has an id like "e7". These ids are the ONLY evidence \
 that exists. You may not cite any other id.
 
 Work in this order:
@@ -81,8 +81,16 @@ visual genuinely matters. A "frame" item is an uninterpreted image identified \
 only by its timestamp: unless a "vision" item describes that moment, nobody \
 has looked at it, so reference it as an illustration and never assert what it \
 depicts.
-9. Preserve timestamps and provenance exactly as given.
-10. Produce compact structured output.
+9. Items of kind "visual_change" and "cursor_track" are deterministic \
+MEASUREMENTS. A visual_change says the picture changed between two timestamps, \
+by how much, and where -- never what changed or why. A cursor_track says the \
+pointer moved in a direction at a speed -- never what the user did. They \
+support "something changed here" or "the pointer moved here"; any statement \
+beyond that (a zoom, a scroll, a click, a setting changed) is an inference, \
+so mark it "inferred" unless speech or a visual description states it. \
+Never present a measurement as proof of an action.
+10. Preserve timestamps and provenance exactly as given.
+11. Produce compact structured output.
 
 Respond with ONLY a single JSON object (no markdown fences, no other text), \
 matching exactly this schema:
@@ -167,17 +175,31 @@ def _pointer_contributed(structured_observation) -> bool:
     return any("pointer" in inf.basis for inf in structured_observation.inferences)
 
 
+def _is_null_measurement(ev: Evidence) -> bool:
+    """A recorded "nothing changed" or "movement not established" measurement.
+    These are honest in the package but are the bulk of the stream (one per
+    quiet interval), so -- like un-contributing pointer readings -- they stay
+    out of the brief rather than bury the measurements that say something."""
+    if ev.kind not in ("visual_change", "cursor_track"):
+        return False
+    try:
+        payload = json.loads(ev.ref)
+    except ValueError:
+        return False
+    return payload.get("status") == "not_detected" or payload.get("state") == "uncertain"
+
+
 def build_synthesis_brief(result: AnalysisResult, transcript: Transcript | None,
                            source: KnowledgeSource) -> SynthesisBrief:
     """Build the compact, id'd evidence brief a `KnowledgeSynthesizer` is
     given. Operates on already-correlated evidence plus (for whole-video
     coverage) time-chunked speech -- never a raw per-segment transcript dump."""
     items: list[BriefEvidenceItem] = []
-    seen: set[tuple[float, str, str]] = set()
+    seen: set[tuple[float, str, str, str]] = set()
     condensed = False
 
     def add(ev: Evidence) -> None:
-        key = (round(ev.timestamp_sec, 3), ev.kind, ev.ref)
+        key = (round(ev.timestamp_sec, 3), ev.kind, ev.ref, ev.source)
         if key in seen:
             return
         seen.add(key)
@@ -196,6 +218,8 @@ def build_synthesis_brief(result: AnalysisResult, transcript: Transcript | None,
         pointer_ok = _pointer_contributed(so)
         for ev in so.observed:
             if ev.kind == "pointer" and not pointer_ok:
+                continue
+            if _is_null_measurement(ev):
                 continue
             if ev.kind == "transcript":
                 continue  # already covered, at whole-video resolution, above
@@ -270,6 +294,12 @@ class _Rejected(Exception):
     dropped and the reason recorded in SynthesisMetadata."""
 
 
+def has_only_measurements(kinds: set[str]) -> bool:
+    """True when the cited kinds include a deterministic measurement and nothing
+    that states or interprets content (speech, a vision description)."""
+    return bool(kinds & {"visual_change", "cursor_track"}) and not (kinds & {"transcript", "vision"})
+
+
 def _verify_claim(raw: dict, brief: SynthesisBrief, duration_sec: float,
                    conflict_windows: list[float]) -> Claim:
     """Turn one raw claim dict into a verified `Claim`, or raise `_Rejected`.
@@ -338,6 +368,11 @@ def _verify_claim(raw: dict, brief: SynthesisBrief, duration_sec: float,
         status = "conflicting"
         limitations.append("Evidence streams materially disagree near this timestamp; "
                             "Video-Lens recorded the conflict rather than resolving it.")
+    elif nature == "observed" and has_only_measurements(kinds):
+        # Nothing cited states or describes what happened -- only that something
+        # changed. Calling the claim "observed" would assert more than the
+        # evidence shows, so it is an inference, whatever the provider called it.
+        status = "inferred"
     else:
         status = nature
 
@@ -353,6 +388,13 @@ def _verify_claim(raw: dict, brief: SynthesisBrief, duration_sec: float,
     has_speech = "transcript" in kinds
     has_interpreted_visual = "vision" in kinds
     has_raw_frame = "frame" in kinds
+    # visual_change / cursor_track are deterministic measurements: they show THAT
+    # the picture changed or the pointer moved, never what it meant. They are
+    # evidence, but they never turn an interpretation into an observation.
+    has_measurement = bool(kinds & {"visual_change", "cursor_track"})
+    measurement_note = ("Measured visual-change / cursor-movement evidence establishes that the "
+                         "picture changed or the pointer moved -- not what changed, why, or what "
+                         "the user did.")
     uninterpreted_note = ("The referenced frame was never visually analyzed, so it "
                            "illustrates this claim but does not corroborate it.")
 
@@ -361,12 +403,16 @@ def _verify_claim(raw: dict, brief: SynthesisBrief, duration_sec: float,
     elif has_speech and has_raw_frame:
         verification = "speech_evidence_with_uninterpreted_frame"
         limitations.append(uninterpreted_note)
+    elif has_speech and has_measurement:
+        verification = "speech_evidence_with_measured_change"
     elif has_speech:
         verification = "speech_evidence_only"
         limitations.append("No visual evidence was cited for this claim -- it rests on speech alone.")
     elif has_interpreted_visual:
         verification = "visual_evidence_only"
         limitations.append("No speech evidence was cited for this claim -- it rests on visuals alone.")
+    elif has_measurement:
+        verification = "measurement_evidence_only"
     elif has_raw_frame:
         verification = "uninterpreted_frame_only"
         limitations.append(uninterpreted_note)
@@ -374,6 +420,9 @@ def _verify_claim(raw: dict, brief: SynthesisBrief, duration_sec: float,
         verification = "pointer_evidence_only"
     else:
         verification = "unverifiable_no_evidence_cited"
+
+    if has_measurement:
+        limitations.append(measurement_note)
 
     return Claim(
         text=text,
@@ -383,7 +432,8 @@ def _verify_claim(raw: dict, brief: SynthesisBrief, duration_sec: float,
         timestamp_end_sec=timestamp_end,
         supporting_evidence=tuple(
             Evidence(timestamp_sec=e.timestamp_sec, kind=e.kind,
-                     ref=e.ref[:_MAX_EVIDENCE_REF], confidence=e.confidence)
+                     ref=e.ref[:_MAX_EVIDENCE_REF], confidence=e.confidence,
+                     timestamp_end_sec=e.timestamp_end_sec, source=e.source)
             for e in cited
         ),
         confidence=confidence,

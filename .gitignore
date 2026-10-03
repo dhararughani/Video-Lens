@@ -14,6 +14,7 @@ smoke_test_output/
 *.jpg
 *.jpeg
 *.png
+!assets/videolens-logo.png
 
 # frame/vision caches, if ever pointed at a path inside the repo
 videolens_frame_cache/

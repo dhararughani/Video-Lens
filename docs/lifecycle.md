@@ -147,7 +147,10 @@ The last four fields are Step 11's optional semantic layer (schema `1.1` —
 see `docs/synthesis.md`). All default to empty/`None`, so a package built
 without a synthesizer is exactly the package it always was, and a 1.0
 consumer reading a 1.1 package finds every field it already knew.
-`summary` stays deterministic in **both** cases — a synthesizer's summary
+Schema `1.2` adds two more optional fields, `visual_changes` and
+`cursor_intelligence` (tuples of `Evidence` of kind `visual_change` /
+`cursor_track`; see `docs/evidence.md`, "Measured evidence"), likewise empty by
+default. `summary` stays deterministic in **both** cases — a synthesizer's summary
 lands in `semantic_summary` and never overwrites it, so the two can never be
 confused for one another.
 
@@ -166,9 +169,15 @@ embedded video, no raw per-segment transcript dump — see
 compactness tests. On the real 270s tutorial video used for validation, the
 resulting package was **5.1 KB** (see Storage below).
 
+## Optional evidence session
+
+`PipelineConfig(session_dir=...)` additionally saves the run's observations
+(transcript + evidence, no media, no conclusions) as a versioned session file,
+and leaves everything above unchanged. See `docs/session.md`.
+
 ## Schema version
 
-`ProcessingMetadata.knowledge_schema_version` (currently `"1.1"`,
+`ProcessingMetadata.knowledge_schema_version` (currently `"1.2"`,
 `core.contracts.KNOWLEDGE_SCHEMA_VERSION`) versions the *shape* of
 `KnowledgePackage`/`KeyPoint`/`KnowledgeSource`/`ProcessingMetadata` —
 independent of `video_lens_version` (the software release, e.g. `"1.0.0"`
@@ -242,7 +251,9 @@ job's temporary files:
 Consequences, all covered by `tests/test_lifecycle.py`:
 
 - **Processing fails** (e.g. ingestion error) → workspace created, nothing
-  written, exception propagates, workspace left on disk.
+  written, exception propagates, workspace left on disk. Whatever
+  `process_video` raises carries that workspace's path as `e.workspace_root`
+  (the filesystem worker reports it — see `docs/worker.md`).
 - **Output validation fails** (`KnowledgePackageError`) → same: nothing
   cleaned up, exception propagates.
 - **Writing the durable output fails** (e.g. output directory is blocked)

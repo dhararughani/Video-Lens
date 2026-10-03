@@ -15,6 +15,9 @@ import numpy as np
 
 from adapters.frames.frame_extractor import FrameExtractor
 from core.contracts import Frame, PointerEvent, PointerTrack, VideoInput
+# The per-pixel "changed" rule (absdiff > 25) lives in core/visual_change.py and
+# is shared with temporal visual-change detection, so the two can never drift.
+from core.visual_change import changed_pixel_mask as _motion_mask
 
 # Cursor-shape heuristics (tuned against synthetic + real test videos, see
 # docs/pointer.md). Expressed relative to frame diagonal/area so they scale
@@ -24,19 +27,10 @@ _MAX_AREA_FRAC = 0.01          # bigger than ~1% of the frame is not a cursor
 _MAX_SCENE_MOTION_FRAC = 0.15  # a scroll/transition/redraw floods most of the frame
 _MAX_STEP_FRAC = 0.15          # max plausible pointer displacement between samples
 _MIN_SOLIDITY = 0.4            # contour_area / bbox_area -- rejects thin chart lines
-_DIFF_THRESHOLD = 25           # 0-255 grayscale diff to count as "changed"
 
 
 def _load_gray(path: str) -> np.ndarray | None:
     return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-
-
-def _motion_mask(img_a: np.ndarray, img_b: np.ndarray) -> np.ndarray | None:
-    if img_a.shape != img_b.shape:
-        return None
-    diff = cv2.absdiff(img_a, img_b)
-    _, mask = cv2.threshold(diff, _DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
-    return mask
 
 
 def _blobs_from_mask(mask: np.ndarray, frame_area: int) -> list[tuple[float, float, float]]:
